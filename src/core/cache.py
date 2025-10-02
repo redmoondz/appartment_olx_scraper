@@ -88,10 +88,11 @@ class CacheManager:
                 self.logger.info(f"Merged {len(apartments)} total apartments")
             
             self._write_apartments(apartments)
-            self.logger.info(f"Saved {len(apartments)} apartments to cache")
+            self.logger.info(f"Successfully saved {len(apartments)} apartments to {self.cache_path}")
             
         except Exception as e:
             self.logger.error(f"Error saving to cache: {e}", exc_info=True)
+            raise  # Re-raise to notify caller
     
     def _write_apartments(self, apartments: List[Apartment]):
         """Write apartments to CSV file"""
@@ -107,7 +108,13 @@ class CacheManager:
             data = [apt.to_dict() for apt in apartments]
             df = pd.DataFrame(data)
         
+        # Write to CSV with explicit flushing
         df.to_csv(self.cache_path, index=False, encoding='utf-8')
+        
+        # Ensure data is written to disk
+        import os
+        with open(self.cache_path, 'r') as f:
+            os.fsync(f.fileno())
     
     def find_new_apartments(
         self,

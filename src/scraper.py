@@ -67,6 +67,15 @@ class ApartmentScraper:
         self.logger.info(f"Max pages: {max_pages or 'unlimited'}")
         self.logger.info(f"Enrich data: {enrich_data}, Fetch phones: {fetch_phones}")
         
+        # Incremental save callback
+        async def save_page_callback(apartments, page_num):
+            """Save apartments after each page"""
+            try:
+                self.cache_manager.save_apartments(apartments, append=True)
+                self.logger.debug(f"Saved page {page_num} apartments incrementally")
+            except Exception as e:
+                self.logger.error(f"Error in incremental save: {e}")
+        
         # Initialize client
         async with OLXClient(
             base_url=self.config.base_url,
@@ -89,7 +98,8 @@ class ApartmentScraper:
                     url, 
                     max_pages,
                     enrich_data=enrich_data,
-                    fetch_phones=fetch_phones
+                    fetch_phones=fetch_phones,
+                    page_callback=save_page_callback  # Enable incremental saving
                 )
                 
                 progress.update(task, completed=True)
@@ -100,16 +110,15 @@ class ApartmentScraper:
                 self.console.print(f"\n[green]Found {len(new_apartments)} new apartments[/green]")
                 
                 if new_apartments:
-                    self.cache_manager.save_apartments(apartments, append=True)
+                    # Already saved incrementally, just display
                     self._display_apartments_table(new_apartments, "New Apartments")
                     return new_apartments
                 else:
                     self.console.print("[yellow]No new apartments found[/yellow]")
                     return []
             else:
-                # Save all apartments
-                self.cache_manager.save_apartments(apartments, append=False)
-                self.console.print(f"\n[green]Scraped {len(apartments)} apartments[/green]")
+                # Already saved incrementally during scraping
+                self.console.print(f"\n[green]Scraped and saved {len(apartments)} apartments[/green]")
                 return apartments
     
     def _display_apartments_table(self, apartments: List[Apartment], title: str = "Apartments"):

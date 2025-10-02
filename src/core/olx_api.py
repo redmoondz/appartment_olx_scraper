@@ -298,12 +298,13 @@ class OLXClient:
             self.logger.error(f"Error parsing card: {e}", exc_info=True)
             return None
     
-    def extract_pagination_info(self, html: str) -> Dict[str, Any]:
+    def extract_pagination_info(self, html: str, current_url: str) -> Dict[str, Any]:
         """
         Extract pagination information from page
         
         Args:
             html: Page HTML content
+            current_url: Current page URL (to preserve query parameters)
             
         Returns:
             Dictionary with current page, total pages, and next page URL
@@ -342,7 +343,14 @@ class OLXClient:
         # Find next page URL
         next_button = pagination.find('a', {'data-testid': 'pagination-forward'})
         if next_button and next_button.get('href'):
-            pagination_info['next_page_url'] = urljoin(self.base_url, next_button['href'])
+            next_href = next_button.get('href')
+            if isinstance(next_href, str):
+                # If href is absolute URL, use it directly
+                if next_href.startswith('http://') or next_href.startswith('https://'):
+                    pagination_info['next_page_url'] = next_href
+                else:
+                    # Otherwise, construct absolute URL from base
+                    pagination_info['next_page_url'] = urljoin(self.base_url, next_href)
         
         return pagination_info
     
@@ -362,10 +370,12 @@ class OLXClient:
             
             detail_data = {}
             
-            # Extract description
-            desc_elem = soup.find('div', {'data-cy': 'ad_description'})
+            # Extract description - UPDATED selector: class css-19duwlz
+            desc_elem = soup.find('div', class_='css-19duwlz')
             if desc_elem:
-                detail_data['description'] = desc_elem.get_text(strip=True)
+                # Get text and preserve line breaks
+                desc_text = desc_elem.get_text(separator='\n', strip=True)
+                detail_data['description'] = desc_text
             
             # Extract photos
             photos = []
@@ -377,12 +387,18 @@ class OLXClient:
                     photos.append(src)
             detail_data['photos'] = photos
             
-            # Extract parameters
-            params_container = soup.find('div', {'data-testid': 'ad-parameters-container'})
+            # Extract parameters - UPDATED: class css-6zsv65 with <p> tags class css-13x8d99
+            params_container = soup.find('div', {'data-testid': 'ad-parameters-container', 'class': 'css-6zsv65'})
             if params_container:
-                params = params_container.find_all('p', class_=re.compile('css-'))
+                # All parameters are in <p> tags with class css-13x8d99
+                params = params_container.find_all('p', class_='css-13x8d99')
+                
+                # Collect all tags (parameters)
+                tags = []
+                
                 for param in params:
                     text = param.get_text(strip=True)
+                    tags.append(text)
                     
                     # Extract floor
                     if 'Поверх:' in text:
@@ -405,18 +421,23 @@ class OLXClient:
                     # Extract furnished
                     if 'Меблювання:' in text:
                         detail_data['furnished'] = 'З меблями' in text or 'З меблями частково' in text
+                
+                # Save all parameter tags
+                detail_data['tags'] = tags
             
-            # Extract watch count (view count)
-            # Watch count is loaded dynamically via JavaScript and not available in initial HTML
-            # We'll leave it as None
-            detail_data['watch_count'] = None
-            
-            # Extract tags (badges/labels) - promotional badges like "Терміново", "VIP" etc
-            tags = []
-            # Look for promotional/highlight badges in the ad
-            # These are usually in specific containers but vary by ad type
-            # For now, keep empty as they're optional
-            detail_data['tags'] = tags
+            # Extract watch count (view count) - UPDATED selector: span class css-16uueru
+            # NOTE: View count is often loaded dynamically via JavaScript and may not be
+            # available in initial HTML. The selector exists but content loads asynchronously.
+            watch_elem = soup.find('span', class_='css-16uueru')
+            if watch_elem:
+                watch_text = watch_elem.get_text(strip=True)
+                # Extract number from text (might be "123 переглядів" or just number)
+                watch_match = re.search(r'(\d+)', watch_text)
+                if watch_match:
+                    detail_data['watch_count'] = int(watch_match.group(1))
+            else:
+                # View count not available - likely loaded via JavaScript
+                detail_data['watch_count'] = None
             
             return detail_data
             
@@ -528,20 +549,34 @@ class OLXClient:
         apartments_data = self.parse_listing_page(html, self.base_url)
         apartments = [Apartment(**data) for data in apartments_data]
         
-        # Enrich data if requested
-        if enrich_data:
-            enriched_apartments = []
-            for apt in apartments:
-                enriched = await self.enrich_apartment_data(apt, fetch_phone=fetch_phones)
-                enriched_apartments.append(enriched)
-            apartments = enriched_apartments
+        # Enrich data if requested - PARALLEL processing for speed
+        if enrich_data and apartments:
+            # Create tasks for parallel enrichment
+            enrichment_tasks = [
+                self.enrich_apartment_data(apt, fetch_phone=fetch_phones)
+                for apt in apartments
+            ]
+            
+            # Execute all enrichment tasks concurrently
+            apartments = await asyncio.gather(*enrichment_tasks)
         
-        # Extract pagination
-        pagination = self.extract_pagination_info(html)
+        # Extract pagination (pass current URL to preserve query params)
+        pagination = self.extract_pagination_info(html, current_url=url)
         next_url = pagination['next_page_url']
         
+        # Try to extract actual page number from URL if pagination shows page 1
+        actual_page = pagination['current_page']
+        if actual_page == 1 and '?page=' in url:
+            # Extract page number from URL
+            try:
+                page_match = re.search(r'[?&]page=(\d+)', url)
+                if page_match:
+                    actual_page = int(page_match.group(1))
+            except:
+                pass
+        
         self.logger.info(
-            f"Scraped page {pagination['current_page']}/{pagination['total_pages']}: "
+            f"Scraped page {actual_page}/{pagination['total_pages']}: "
             f"found {len(apartments)} apartments"
         )
         
@@ -552,7 +587,8 @@ class OLXClient:
         start_url: str,
         max_pages: Optional[int] = None,
         enrich_data: bool = False,
-        fetch_phones: bool = False
+        fetch_phones: bool = False,
+        page_callback=None
     ) -> List[Apartment]:
         """
         Scrape all listing pages
@@ -562,6 +598,7 @@ class OLXClient:
             max_pages: Maximum number of pages to scrape (None for all)
             enrich_data: Whether to fetch detailed information for each apartment
             fetch_phones: Whether to fetch contact phones (only if enrich_data=True)
+            page_callback: Optional callback function called after each page with (apartments, page_num)
             
         Returns:
             List of all apartments found
@@ -584,6 +621,11 @@ class OLXClient:
                     fetch_phones=fetch_phones
                 )
                 all_apartments.extend(apartments)
+                
+                # Call callback if provided (for incremental saving)
+                if page_callback and apartments:
+                    await page_callback(apartments, page_count)
+                
                 current_url = next_url
                 
             except Exception as e:
